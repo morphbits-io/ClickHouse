@@ -36,7 +36,7 @@ String urlEncode(const String & value)
 
 std::optional<String> extractObjectName(const Poco::JSON::Object::Ptr & object)
 {
-    static constexpr std::array keys = {"object", "id", "name", "key", "path"};
+    static constexpr std::array<const char *, 5> keys = {"object", "id", "name", "key", "path"};
     for (const auto & key : keys)
     {
         if (!object->has(key))
@@ -265,7 +265,7 @@ void MorphObjectStorage::loadObjectsIfNeeded() const
         else if (parsed.type() == typeid(Poco::JSON::Object::Ptr))
         {
             const auto root = parsed.extract<Poco::JSON::Object::Ptr>();
-            static constexpr std::array list_keys = {"objects", "items", "results", "data"};
+            static constexpr std::array<const char *, 4> list_keys = {"objects", "items", "results", "data"};
             bool found_array = false;
             for (const auto & key : list_keys)
             {

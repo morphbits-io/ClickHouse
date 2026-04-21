@@ -25,7 +25,7 @@ struct MorphStorageParsedArguments : private StorageParsedArguments
           " - bucket, token, format\n"
           " - bucket, token, format, compression_method\n";
 
-    static constexpr std::string getSignatures(bool with_structure = true)
+    static constexpr const char * getSignatures(bool with_structure = true)
     {
         return with_structure ? signatures_with_structure : signatures_without_structure;
     }
