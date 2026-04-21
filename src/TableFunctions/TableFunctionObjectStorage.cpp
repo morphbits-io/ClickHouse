@@ -383,7 +383,7 @@ void registerTableFunctionObjectStorage(TableFunctionFactory & factory)
 #endif
     factory.registerFunction<TableFunctionObjectStorage<MorphDefinition, StorageMorphConfiguration>>(
         {
-            .description=R"(The table function can be used to read Parquet objects from a Morph bucket.)",
+            .description = R"(The table function can be used to read Parquet objects from a Morph bucket.)",
             .examples{
             {
                 MorphDefinition::name,
