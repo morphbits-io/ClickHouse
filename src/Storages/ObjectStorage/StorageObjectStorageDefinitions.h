@@ -49,6 +49,13 @@ struct HDFSDefinition
     static constexpr auto object_storage_type = "hdfs";
 };
 
+struct MorphDefinition
+{
+    static constexpr auto name = "morph";
+    static constexpr auto storage_engine_name = "Morph";
+    static constexpr auto object_storage_type = "web";
+};
+
 struct IcebergDefinition
 {
     static constexpr auto name = "iceberg";

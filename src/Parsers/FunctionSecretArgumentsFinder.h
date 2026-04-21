@@ -104,8 +104,8 @@ protected:
         }
         else if ((function->name() == "s3") || (function->name() == "cosn") || (function->name() == "oss") ||
                  (function->name() == "deltaLake") || (function->name() == "hudi") || (function->name() == "iceberg") ||
-                 (function->name() == "gcs") || (function->name() == "icebergS3") || (function->name() == "paimon") ||
-                 (function->name() == "paimonS3"))
+                  (function->name() == "gcs") || (function->name() == "icebergS3") || (function->name() == "paimon") ||
+                  (function->name() == "paimonS3"))
         {
             /// s3('url', 'aws_access_key_id', 'aws_secret_access_key', ...)
             findS3FunctionSecretArguments(/* is_cluster_function= */ false);
@@ -116,6 +116,11 @@ protected:
         {
             /// s3Cluster('cluster_name', 'url', 'aws_access_key_id', 'aws_secret_access_key', ...)
             findS3FunctionSecretArguments(/* is_cluster_function= */ true);
+        }
+        else if (function->name() == "morph")
+        {
+            /// morph('bucket', 'token', ...)
+            findMorphFunctionSecretArguments();
         }
         else if ((function->name() == "azureBlobStorage") || (function->name() == "deltaLakeAzure") ||
                  (function->name() == "icebergAzure") || (function->name() == "paimonAzure"))
@@ -416,6 +421,21 @@ protected:
         /// We're going to replace 'account_key' with '[HIDDEN]' if account_key is used in the signature
         if (url_arg_idx + 4 < count)
             markSecretArgument(url_arg_idx + 4);
+    }
+
+    void findMorphFunctionSecretArguments()
+    {
+        if (isNamedCollectionName(0))
+        {
+            findSecretNamedArgument("token", 1);
+            return;
+        }
+
+        findSecretNamedArgument("token", 0);
+
+        size_t count = excludeS3OrURLNestedMaps();
+        if (count > 1)
+            markSecretArgument(1);
     }
 
     bool maskAzureConnectionString(ssize_t url_arg_idx, bool argument_is_named = false, size_t start = 0)

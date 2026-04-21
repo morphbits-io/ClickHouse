@@ -10,6 +10,7 @@
 #include <Storages/ObjectStorage/Azure/Configuration.h>
 #include <Storages/ObjectStorage/DataLakes/DataLakeConfiguration.h>
 #include <Storages/ObjectStorage/HDFS/Configuration.h>
+#include <Storages/ObjectStorage/MorphConfiguration.h>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageSettings.h>
@@ -175,6 +176,22 @@ void registerStorageHDFS(StorageFactory & factory)
 }
 #endif
 
+void registerStorageMorph(StorageFactory & factory)
+{
+    factory.registerStorage(MorphDefinition::storage_engine_name, [=](const StorageFactory::Arguments & args)
+    {
+        auto configuration = std::make_shared<StorageMorphConfiguration>();
+        return createStorageObjectStorage(args, configuration);
+    },
+    {
+        .supports_settings = true,
+        .supports_sort_order = true,
+        .supports_schema_inference = true,
+        .source_access_type = AccessTypeObjects::Source::URL,
+        .has_builtin_setting_fn = StorageObjectStorageSettings::hasBuiltin,
+    });
+}
+
 void registerStorageObjectStorage(StorageFactory & factory)
 {
 #if USE_AWS_S3
@@ -189,6 +206,7 @@ void registerStorageObjectStorage(StorageFactory & factory)
 #if USE_HDFS
     registerStorageHDFS(factory);
 #endif
+    registerStorageMorph(factory);
     UNUSED(factory);
 }
 
