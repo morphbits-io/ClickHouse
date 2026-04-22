@@ -1,6 +1,5 @@
 #pragma once
 
-#include <Common/SharedMutex.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
 #include <Interpreters/Context_fwd.h>
 
@@ -59,16 +58,12 @@ private:
     [[noreturn]] static void throwReadOnly();
     String makeListURL() const;
     String makeObjectURL(const String & object_name) const;
-    void loadObjectsIfNeeded() const;
+    RelativePathsWithMetadata fetchObjects(const std::string & path, size_t max_keys) const;
 
     const String endpoint;
     const String bucket;
     const String token;
     const ContextPtr context;
-
-    mutable SharedMutex objects_mutex;
-    mutable bool objects_loaded = false;
-    mutable RelativePathsWithMetadata objects;
 };
 
 }

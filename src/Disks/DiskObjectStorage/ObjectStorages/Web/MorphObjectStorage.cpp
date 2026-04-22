@@ -85,10 +85,13 @@ std::optional<ObjectMetadata> extractMetadata(const Poco::JSON::Object::Ptr & ob
     return has_metadata ? std::optional(metadata) : std::nullopt;
 }
 
-void addObjectsFromArray(const Poco::JSON::Array::Ptr & array, RelativePathsWithMetadata & result)
+void addObjectsFromArray(const Poco::JSON::Array::Ptr & array, RelativePathsWithMetadata & result, size_t max_keys)
 {
     for (size_t i = 0; i < array->size(); ++i)
     {
+        if (max_keys > 0 && result.size() >= max_keys)
+            break;
+
         const auto value = array->get(i);
         if (value.isString())
         {
@@ -158,18 +161,16 @@ std::unique_ptr<WriteBufferFromFileBase> MorphObjectStorage::writeObject(
 
 void MorphObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
 {
-    loadObjectsIfNeeded();
-
-    std::shared_lock lock(objects_mutex);
-    for (const auto & object : objects)
+    size_t remaining_keys = max_keys;
+    if (max_keys > 0)
     {
-        if (!startsWith(object->relative_path, path))
-            continue;
-
-        children.push_back(object);
-        if (max_keys > 0 && children.size() >= max_keys)
-            break;
+        if (children.size() >= max_keys)
+            return;
+        remaining_keys = max_keys - children.size();
     }
+
+    auto objects = fetchObjects(path, remaining_keys);
+    children.insert(children.end(), objects.begin(), objects.end());
 }
 
 ObjectMetadata MorphObjectStorage::getObjectMetadata(const std::string & path, bool) const
@@ -182,8 +183,7 @@ ObjectMetadata MorphObjectStorage::getObjectMetadata(const std::string & path, b
 
 std::optional<ObjectMetadata> MorphObjectStorage::tryGetObjectMetadata(const std::string & path, bool) const
 {
-    loadObjectsIfNeeded();
-    std::shared_lock lock(objects_mutex);
+    auto objects = fetchObjects(path, /* max_keys */ 1);
     for (const auto & object : objects)
     {
         if (object->relative_path == path)
@@ -227,19 +227,17 @@ String MorphObjectStorage::makeObjectURL(const String & object_name) const
     return fmt::format("{}/v1/buckets/{}/objects/{}", endpoint, urlEncode(bucket), urlEncode(object_name));
 }
 
-void MorphObjectStorage::loadObjectsIfNeeded() const
+RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & path, size_t max_keys) const
 {
-    {
-        std::shared_lock lock(objects_mutex);
-        if (objects_loaded)
-            return;
-    }
-
-    std::unique_lock lock(objects_mutex);
-    if (objects_loaded)
-        return;
-
     Poco::URI list_uri(makeListURL());
+    Poco::URI::QueryParameters query_parameters;
+    if (!path.empty())
+        query_parameters.emplace_back("path", path);
+    if (max_keys > 0)
+        query_parameters.emplace_back("limit", std::to_string(max_keys));
+    if (!query_parameters.empty())
+        list_uri.setQueryParameters(query_parameters);
+
     HTTPHeaderEntries headers{{"Authorization", fmt::format("Bearer {}", token)}};
     auto buffer = BuilderRWBufferFromHTTP(list_uri)
         .withConnectionGroup(HTTPConnectionGroupType::DISK)
@@ -254,13 +252,14 @@ void MorphObjectStorage::loadObjectsIfNeeded() const
     String response;
     readStringUntilEOF(response, *buffer);
 
+    RelativePathsWithMetadata objects;
     if (!response.empty())
     {
         Poco::JSON::Parser parser;
         const auto parsed = parser.parse(response);
         if (parsed.type() == typeid(Poco::JSON::Array::Ptr))
         {
-            addObjectsFromArray(parsed.extract<Poco::JSON::Array::Ptr>(), objects);
+            addObjectsFromArray(parsed.extract<Poco::JSON::Array::Ptr>(), objects, max_keys);
         }
         else if (parsed.type() == typeid(Poco::JSON::Object::Ptr))
         {
@@ -274,7 +273,7 @@ void MorphObjectStorage::loadObjectsIfNeeded() const
                 const auto value = root->get(key);
                 if (value.type() == typeid(Poco::JSON::Array::Ptr))
                 {
-                    addObjectsFromArray(value.extract<Poco::JSON::Array::Ptr>(), objects);
+                    addObjectsFromArray(value.extract<Poco::JSON::Array::Ptr>(), objects, max_keys);
                     found_array = true;
                     break;
                 }
@@ -289,7 +288,7 @@ void MorphObjectStorage::loadObjectsIfNeeded() const
         }
     }
 
-    objects_loaded = true;
+    return objects;
 }
 
 }
