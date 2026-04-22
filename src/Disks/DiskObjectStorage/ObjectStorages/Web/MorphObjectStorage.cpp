@@ -183,6 +183,8 @@ ObjectMetadata MorphObjectStorage::getObjectMetadata(const std::string & path, b
 
 std::optional<ObjectMetadata> MorphObjectStorage::tryGetObjectMetadata(const std::string & path, bool) const
 {
+    /// Use unbounded list here because Morph `path` filtering may be prefix-based.
+    /// We need to verify exact equality below.
     auto objects = fetchObjects(path, /* max_keys */ 0);
     for (const auto & object : objects)
     {
@@ -232,7 +234,7 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
     Poco::URI list_uri(makeListURL());
     Poco::URI::QueryParameters query_parameters;
     /// Morph API supports filtering listed objects by path.
-    /// We still check exact path matches in callers where needed.
+    /// Metadata callers still verify exact path equality separately.
     if (!path.empty())
         query_parameters.emplace_back("path", path);
     if (max_keys > 0)
