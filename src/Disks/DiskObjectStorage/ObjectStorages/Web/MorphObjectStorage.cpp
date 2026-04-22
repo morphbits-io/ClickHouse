@@ -161,7 +161,7 @@ std::unique_ptr<WriteBufferFromFileBase> MorphObjectStorage::writeObject(
 
 void MorphObjectStorage::listObjects(const std::string & path, RelativePathsWithMetadata & children, size_t max_keys) const
 {
-    size_t remaining_keys = max_keys;
+    size_t remaining_keys = 0;
     if (max_keys > 0)
     {
         if (children.size() >= max_keys)
@@ -183,7 +183,7 @@ ObjectMetadata MorphObjectStorage::getObjectMetadata(const std::string & path, b
 
 std::optional<ObjectMetadata> MorphObjectStorage::tryGetObjectMetadata(const std::string & path, bool) const
 {
-    auto objects = fetchObjects(path, /* max_keys */ 1);
+    auto objects = fetchObjects(path, /* max_keys */ 0);
     for (const auto & object : objects)
     {
         if (object->relative_path == path)
@@ -231,6 +231,8 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
 {
     Poco::URI list_uri(makeListURL());
     Poco::URI::QueryParameters query_parameters;
+    /// Morph API supports filtering listed objects by path.
+    /// We still check exact path matches in callers where needed.
     if (!path.empty())
         query_parameters.emplace_back("path", path);
     if (max_keys > 0)
