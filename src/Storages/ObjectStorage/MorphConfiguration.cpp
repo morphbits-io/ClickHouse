@@ -1,5 +1,6 @@
 #include <Storages/ObjectStorage/MorphConfiguration.h>
 
+#include <Common/RemoteHostFilter.h>
 #include <Core/Settings.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/Web/MorphObjectStorage.h>
 #include <Interpreters/Context.h>
@@ -37,8 +38,12 @@ namespace ErrorCodes
 namespace
 {
 
+/// Built-in fallback used only when neither <morph><endpoint> in the server
+/// config nor an explicit `endpoint=` argument is provided.
 constexpr auto DEFAULT_MORPH_ENDPOINT = "https://morph.morphbits.io";
-constexpr auto DEFAULT_PATH = "*.parquet";
+/// Morph addresses each parquet file by row group, e.g. `data.parquet/rg-0`,
+/// so the default glob has to descend one level past the parquet container.
+constexpr auto DEFAULT_PATH = "*.parquet/*";
 
 String trimTrailingSlash(String value)
 {
@@ -47,13 +52,21 @@ String trimTrailingSlash(String value)
     return value;
 }
 
+/// Server-wide default endpoint, configurable via:
+///   <clickhouse><morph><endpoint>http://host:port</endpoint></morph></clickhouse>
+String getConfiguredDefaultEndpoint(const ContextPtr & context)
+{
+    return trimTrailingSlash(context->getConfigRef().getString("morph.endpoint", DEFAULT_MORPH_ENDPOINT));
 }
 
-void MorphStorageParsedArguments::fromNamedCollection(const NamedCollection & collection, ContextPtr)
+}
+
+void MorphStorageParsedArguments::fromNamedCollection(const NamedCollection & collection, ContextPtr context)
 {
     bucket = collection.get<String>("bucket");
     token = collection.get<String>("token");
-    endpoint = trimTrailingSlash(collection.getOrDefault<String>("endpoint", DEFAULT_MORPH_ENDPOINT));
+    endpoint = trimTrailingSlash(collection.getOrDefault<String>("endpoint", getConfiguredDefaultEndpoint(context)));
+    path = collection.getOrDefault<String>("path", DEFAULT_PATH);
 
     format = collection.getOrDefault<String>("format", "auto");
     compression_method = collection.getOrDefault<String>("compression_method", collection.getOrDefault<String>("compression", "auto"));
@@ -90,7 +103,8 @@ void MorphStorageParsedArguments::fromAST(ASTs & args, ContextPtr context, bool 
         compression_method = checkAndGetLiteralArgument<String>(args[3], "compression_method");
     }
 
-    endpoint = DEFAULT_MORPH_ENDPOINT;
+    endpoint = getConfiguredDefaultEndpoint(context);
+    path = DEFAULT_PATH;
 }
 
 String StorageMorphConfiguration::getDataSourceDescription() const
@@ -194,12 +208,18 @@ void StorageMorphConfiguration::addStructureAndFormatToArgsIfNeeded(
 
 void StorageMorphConfiguration::initializeFromParsedArguments(const MorphStorageParsedArguments & parsed_arguments)
 {
+    /// Validate upfront so empty-bucket errors surface before schema inference
+    /// triggers any HTTP I/O against the Morph endpoint.
+    validateNamespace(parsed_arguments.bucket);
+    if (parsed_arguments.endpoint.empty())
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Morph endpoint cannot be empty");
+
     StorageObjectStorageConfiguration::initializeFromParsedArguments(parsed_arguments);
     bucket = parsed_arguments.bucket;
     token = parsed_arguments.token;
     endpoint = trimTrailingSlash(parsed_arguments.endpoint);
     raw_uri = fmt::format("{}/v1/buckets/{}", endpoint, bucket);
-    path = DEFAULT_PATH;
+    path = parsed_arguments.path.empty() ? DEFAULT_PATH : parsed_arguments.path;
 }
 
 void StorageMorphConfiguration::fromNamedCollection(const NamedCollection & collection, ContextPtr context)

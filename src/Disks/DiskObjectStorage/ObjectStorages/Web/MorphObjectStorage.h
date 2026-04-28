@@ -1,6 +1,8 @@
 #pragma once
 
+#include <Common/Logger.h>
 #include <Disks/DiskObjectStorage/ObjectStorages/IObjectStorage.h>
+#include <IO/HTTPHeaderEntries.h>
 #include <Interpreters/Context_fwd.h>
 
 namespace DB
@@ -56,14 +58,17 @@ public:
 
 private:
     [[noreturn]] static void throwReadOnly();
+
+    HTTPHeaderEntries makeAuthHeaders() const;
     String makeListURL() const;
     String makeObjectURL(const String & object_name) const;
-    RelativePathsWithMetadata fetchObjects(const std::string & path, size_t max_keys) const;
+    RelativePathsWithMetadata fetchObjects(const std::string & prefix, size_t max_keys) const;
 
     const String endpoint;
     const String bucket;
     const String token;
     const ContextPtr context;
+    const LoggerPtr log;
 };
 
 }

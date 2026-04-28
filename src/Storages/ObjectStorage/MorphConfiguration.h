@@ -38,6 +38,7 @@ struct MorphStorageParsedArguments : private StorageParsedArguments
     String bucket;
     String token;
     String endpoint;
+    String path;
 
     void fromNamedCollection(const NamedCollection & collection, ContextPtr context);
     void fromAST(ASTs & args, ContextPtr context, bool with_structure);

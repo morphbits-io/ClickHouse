@@ -7,3 +7,6 @@ CREATE TABLE morph_storage_engine
 ENGINE = Morph('bucket-id', 'token', 'Parquet');
 
 DROP TABLE morph_storage_engine;
+
+-- Empty bucket must fail fast, before any HTTP call is attempted.
+SELECT * FROM morph('', 'token', 'Parquet', 'x UInt64'); -- { serverError BAD_ARGUMENTS }
