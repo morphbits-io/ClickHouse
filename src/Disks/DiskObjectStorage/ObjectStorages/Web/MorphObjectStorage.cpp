@@ -1,19 +1,32 @@
 #include <Disks/DiskObjectStorage/ObjectStorages/Web/MorphObjectStorage.h>
 
+#include <Columns/ColumnConst.h>
+#include <Columns/IColumn.h>
+#include <Common/FieldVisitorToString.h>
 #include <Common/logger_useful.h>
-#include <Disks/IO/ReadBufferFromWebServer.h>
+#include <Core/Field.h>
+#include <DataTypes/DataTypeNullable.h>
+#include <DataTypes/IDataType.h>
+#include <Disks/DiskObjectStorage/ObjectStorages/Web/ReadBufferFromMorphServer.h>
+#include <Functions/IFunction.h>
 #include <IO/ConnectionTimeouts.h>
 #include <IO/ReadHelpers.h>
 #include <IO/ReadWriteBufferFromHTTP.h>
+#include <Interpreters/ActionsDAG.h>
 #include <Interpreters/Context.h>
+#include <Storages/StorageInMemoryMetadata.h>
 
 #include <Poco/DateTime.h>
 #include <Poco/DateTimeParser.h>
 #include <Poco/JSON/Array.h>
 #include <Poco/JSON/Object.h>
 #include <Poco/JSON/Parser.h>
+#include <Poco/JSON/Stringifier.h>
+#include <Poco/Net/HTTPRequest.h>
 #include <Poco/URI.h>
 #include <fmt/format.h>
+
+#include <sstream>
 
 namespace DB
 {
@@ -40,6 +53,133 @@ String encodePathSegment(const String & value)
     return encoded;
 }
 
+/// Translate a single comparison node `func(input_col, const)` (or its
+/// commutative form `func(const, input_col)`) into one
+/// `MorphObjectStorage::QueryPredicate` carrying the SQL relation. The
+/// row-group min/max layout is not visible here — the wire format only
+/// names the original Parquet column. Returns an empty optional for
+/// shapes we can't safely push down (functions of columns,
+/// two-column comparisons, non-numeric columns, IN-with-subquery,
+/// LIKE, NOT, etc.). Skipped conjuncts are silently dropped from the
+/// pushdown set; ClickHouse re-evaluates them after the row-group
+/// payload is opened.
+std::optional<MorphObjectStorage::QueryPredicate> translateLeafComparison(
+    const ActionsDAG::Node * node,
+    const NamesAndTypesList & physical_columns)
+{
+    if (node->type != ActionsDAG::ActionType::FUNCTION || !node->function_base)
+        return std::nullopt;
+    if (node->children.size() != 2)
+        return std::nullopt;
+
+    const String op_name = node->function_base->getName();
+    if (op_name != "equals" && op_name != "notEquals"
+        && op_name != "less" && op_name != "greater"
+        && op_name != "lessOrEquals" && op_name != "greaterOrEquals")
+        return std::nullopt;
+
+    const ActionsDAG::Node * lhs = node->children[0];
+    const ActionsDAG::Node * rhs = node->children[1];
+
+    const ActionsDAG::Node * col_node = nullptr;
+    const ActionsDAG::Node * const_node = nullptr;
+    bool flipped = false;
+
+    if (lhs->type == ActionsDAG::ActionType::INPUT && rhs->column && isColumnConst(*rhs->column))
+    {
+        col_node = lhs; const_node = rhs;
+    }
+    else if (rhs->type == ActionsDAG::ActionType::INPUT && lhs->column && isColumnConst(*lhs->column))
+    {
+        col_node = rhs; const_node = lhs;
+        flipped = true;
+    }
+    else
+        return std::nullopt;
+
+    DataTypePtr col_type;
+    for (const auto & c : physical_columns)
+    {
+        if (c.name == col_node->result_name)
+        {
+            col_type = c.type;
+            break;
+        }
+    }
+    if (!col_type)
+        return std::nullopt;
+
+    /// Numeric-only pushdown for now — Morph's row-group attributes
+    /// store decimal-encoded numerics on which `MatchNum*` works.
+    /// String-column pushdown is a future extension.
+    DataTypePtr inner_type = removeNullable(col_type);
+    if (!isNumber(*inner_type))
+        return std::nullopt;
+
+    Field f;
+    const_node->column->get(0, f);
+    String value_str = applyVisitor(FieldVisitorToString(), f);
+    if (value_str.empty())
+        return std::nullopt;
+    /// `FieldVisitorToString` quotes strings ('foo', "foo"); for numerics
+    /// it produces a bare decimal. Drop predicates whose stringified form
+    /// looks quoted — pushdown is best-effort.
+    if (value_str.front() == '\'' || value_str.front() == '"')
+        return std::nullopt;
+
+    String op = op_name;
+    if (flipped)
+    {
+        if (op == "less") op = "greater";
+        else if (op == "greater") op = "less";
+        else if (op == "lessOrEquals") op = "greaterOrEquals";
+        else if (op == "greaterOrEquals") op = "lessOrEquals";
+    }
+
+    String wire_op;
+    if (op == "equals")              wire_op = "EQ";
+    else if (op == "notEquals")      wire_op = "NE";
+    else if (op == "less")           wire_op = "LT";
+    else if (op == "lessOrEquals")   wire_op = "LE";
+    else if (op == "greater")        wire_op = "GT";
+    else if (op == "greaterOrEquals") wire_op = "GE";
+    else
+        return std::nullopt;
+
+    return MorphObjectStorage::QueryPredicate{col_node->result_name, std::move(wire_op), std::move(value_str)};
+}
+
+void collectQueryPredicates(
+    const ActionsDAG::Node * node,
+    const NamesAndTypesList & physical_columns,
+    std::vector<MorphObjectStorage::QueryPredicate> & out)
+{
+    if (!node)
+        return;
+
+    if (node->type == ActionsDAG::ActionType::FUNCTION && node->function_base)
+    {
+        const String op_name = node->function_base->getName();
+        if (op_name == "and")
+        {
+            for (const auto * child : node->children)
+                collectQueryPredicates(child, physical_columns, out);
+            return;
+        }
+        if (op_name == "or")
+        {
+            /// NeoFS filters AND-combine; OR pushdown would need
+            /// multiple search calls + union. Drop the disjunct
+            /// entirely so the overall conjunctive predicate doesn't
+            /// lose rows — ClickHouse still evaluates it post-load.
+            return;
+        }
+    }
+
+    if (auto leaf = translateLeafComparison(node, physical_columns))
+        out.push_back(std::move(*leaf));
+}
+
 }
 
 MorphObjectStorage::MorphObjectStorage(String endpoint_, String bucket_, String token_, ContextPtr context_)
@@ -64,12 +204,18 @@ bool MorphObjectStorage::exists(const StoredObject & object) const
 std::unique_ptr<ReadBufferFromFileBase> MorphObjectStorage::readObject(
     const StoredObject & object,
     const ReadSettings & read_settings,
-    std::optional<size_t>) const
+    std::optional<size_t> read_hint) const
 {
-    return std::make_unique<ReadBufferFromWebServer>(
-        makeObjectURL(object.remote_path),
+    /// Reads go through the Parquet-aware endpoint which serves the stored
+    /// object verbatim — each object is already a complete, self-contained
+    /// single-row-group Parquet file produced at upload time. So the size
+    /// reported by `listObjects` is the right `Content-Length`; pass it in
+    /// when known to skip the per-read HEAD that
+    /// `ReadBufferFromMorphServer::tryGetFileSize` would otherwise issue.
+    return std::make_unique<ReadBufferFromMorphServer>(
+        makeParquetObjectURL(object.remote_path),
         context,
-        object.bytes_size,
+        read_hint.value_or(0),
         patchSettings(read_settings),
         read_settings.remote_read_buffer_use_external_buffer,
         /* read_until_position */ 0,
@@ -90,6 +236,19 @@ void MorphObjectStorage::listObjects(const std::string & path, RelativePathsWith
 {
     if (max_keys > 0 && children.size() >= max_keys)
         return;
+
+    /// Schema inference / sample-path probing only need one
+    /// representative object. Hit Morph's dedicated
+    /// `v1GetParquetsMeta` endpoint instead of the full
+    /// `v1SearchParquets` POST — the dedicated endpoint hard-wires
+    /// `count=1`, takes only `prefix`, and avoids transmitting the
+    /// (always empty in this mode) filter list.
+    if (is_metadata_probe)
+    {
+        auto objects = fetchOneObjectByPrefix(path);
+        children.insert(children.end(), std::make_move_iterator(objects.begin()), std::make_move_iterator(objects.end()));
+        return;
+    }
 
     const size_t remaining = max_keys > 0 ? max_keys - children.size() : 0;
     auto objects = fetchObjects(path, remaining);
@@ -170,16 +329,161 @@ String MorphObjectStorage::makeListURL() const
     return fmt::format("{}/v1/buckets/{}/objects", endpoint, encodePathSegment(bucket));
 }
 
+String MorphObjectStorage::makeParquetSearchURL() const
+{
+    return fmt::format("{}/v1/buckets/{}/parquets/search", endpoint, encodePathSegment(bucket));
+}
+
+String MorphObjectStorage::makeParquetMetaURL() const
+{
+    return fmt::format("{}/v1/buckets/{}/parquets/meta", endpoint, encodePathSegment(bucket));
+}
+
+void MorphObjectStorage::setQueryPredicate(const ActionsDAG::Node * predicate, const StorageMetadataPtr & metadata)
+{
+    query_predicates.clear();
+    /// Schema inference / sample-path probing pass a null
+    /// `StorageMetadataPtr`; data reads always pass a real one. One
+    /// representative object is enough to recover the parquet schema,
+    /// so `listObjects` dispatches to `fetchOneObjectByPrefix`
+    /// (Morph's dedicated `v1GetParquetsMeta` endpoint) instead of
+    /// the full `v1SearchParquets` POST.
+    is_metadata_probe = !metadata;
+    if (!predicate || !metadata)
+        return;
+    auto physical = metadata->getColumns().getAllPhysical();
+    collectQueryPredicates(predicate, physical, query_predicates);
+}
+
 String MorphObjectStorage::makeObjectURL(const String & object_name) const
 {
     return fmt::format("{}/v1/buckets/{}/objects/{}", endpoint, encodePathSegment(bucket), encodePathSegment(object_name));
 }
 
+String MorphObjectStorage::makeParquetObjectURL(const String & object_name) const
+{
+    return fmt::format("{}/v1/buckets/{}/parquets/{}", endpoint, encodePathSegment(bucket), encodePathSegment(object_name));
+}
+
+namespace
+{
+
+/// Morph's parquet endpoints all return `{objects: [{objectId, attributes}], …}`
+/// with a fixed attribute set: FilePath (URL path) and payload length
+/// (Content-Length hint for `readObject`). `$Object:creationEpoch` is also
+/// returned but deliberately ignored — it's a NeoFS epoch index, not a
+/// Unix timestamp, so feeding it into `last_modified` would store a
+/// garbage calendar date.
+constexpr auto kAttrFilePath      = "FilePath";
+constexpr auto kAttrPayloadLength = "$Object:payloadLength";
+
+/// Translate one entry from Morph's `objects` array into a
+/// `RelativePathWithMetadata`. Returns nullptr (and logs a warning) when the
+/// entry is malformed — a single bad entry shouldn't fail the whole listing.
+RelativePathWithMetadataPtr parseSearchObjectEntry(const Poco::Dynamic::Var & entry_value, size_t index, const LoggerPtr & log)
+{
+    if (entry_value.type() != typeid(Poco::JSON::Object::Ptr))
+    {
+        LOG_WARNING(log, "Morph parquet response entry at index {} is not a JSON object, skipping", index);
+        return nullptr;
+    }
+
+    const auto entry = entry_value.extract<Poco::JSON::Object::Ptr>();
+    const auto attrs_value = entry->get("attributes");
+    if (attrs_value.type() != typeid(Poco::JSON::Object::Ptr))
+    {
+        LOG_WARNING(log, "Morph parquet response entry at index {} has no `attributes` object, skipping", index);
+        return nullptr;
+    }
+    const auto attrs = attrs_value.extract<Poco::JSON::Object::Ptr>();
+
+    if (!attrs->has(kAttrFilePath))
+    {
+        LOG_WARNING(log, "Morph parquet response entry at index {} is missing FilePath attribute, skipping", index);
+        return nullptr;
+    }
+    const auto fp_value = attrs->get(kAttrFilePath);
+    if (!fp_value.isString())
+    {
+        LOG_WARNING(log, "Morph parquet response entry at index {} has non-string FilePath, skipping", index);
+        return nullptr;
+    }
+    const auto object_path = fp_value.convert<String>();
+    if (object_path.empty())
+    {
+        LOG_WARNING(log, "Morph parquet response entry at index {} has empty FilePath, skipping", index);
+        return nullptr;
+    }
+
+    ObjectMetadata meta;
+    if (attrs->has(kAttrPayloadLength))
+    {
+        const auto pl_value = attrs->get(kAttrPayloadLength);
+        if (pl_value.isString())
+        {
+            try
+            {
+                meta.size_bytes = std::stoull(pl_value.convert<String>());
+            }
+            catch (...)
+            {
+                meta.is_size_known = false;
+            }
+        }
+        else
+        {
+            meta.size_bytes = pl_value.convert<UInt64>();
+        }
+    }
+    else
+    {
+        meta.is_size_known = false;
+    }
+
+    /// `last_modified` stays unset: see the leading-comment note about
+    /// `$Object:creationEpoch` not being a Unix timestamp.
+
+    return std::make_shared<RelativePathWithMetadata>(object_path, std::move(meta));
+}
+
+}
+
 RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & prefix, size_t max_keys) const
 {
     RelativePathsWithMetadata objects;
-    const auto auth_headers = makeAuthHeaders();
-    const auto list_url = makeListURL();
+
+    /// Build the JSON request body once. Cursor and pagination size go on
+    /// the query string per the OpenAPI spec; the body itself is invariant
+    /// between paginated calls. `prefix` and `filters` carry SQL-level data
+    /// only — the row-group min/max layout is a server-side concern.
+    Poco::JSON::Object::Ptr body = new Poco::JSON::Object;
+    if (!prefix.empty())
+        body->set("prefix", prefix);
+
+    Poco::JSON::Array::Ptr filters_array = new Poco::JSON::Array;
+    for (const auto & p : query_predicates)
+    {
+        Poco::JSON::Object::Ptr f = new Poco::JSON::Object;
+        f->set("column", p.column);
+        f->set("op", p.op);
+        f->set("value", p.value);
+        filters_array->add(f);
+    }
+    body->set("filters", filters_array);
+
+    String body_str;
+    {
+        std::ostringstream oss;
+        Poco::JSON::Stringifier::stringify(body, oss);
+        body_str = oss.str();
+    }
+
+    auto auth_headers = makeAuthHeaders();
+    /// Body is sent on every paginated POST; advertise its content type
+    /// once and let the timeouts/auth share between calls.
+    auth_headers.emplace_back("Content-Type", "application/json");
+
+    const auto query_url = makeParquetSearchURL();
     const auto timeouts = ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings());
 
     String cursor;
@@ -194,23 +498,23 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
             page_limit = std::min(page_limit, remaining);
         }
 
-        Poco::URI uri(list_url);
+        Poco::URI uri(query_url);
         Poco::URI::QueryParameters query_parameters;
-        if (!prefix.empty())
-            query_parameters.emplace_back("prefix", prefix);
         query_parameters.emplace_back("maxItems", std::to_string(page_limit));
         if (!cursor.empty())
             query_parameters.emplace_back("cursor", cursor);
         uri.setQueryParameters(query_parameters);
 
-        LOG_DEBUG(log, "Listing morph objects: url={}", uri.toString());
+        LOG_DEBUG(log, "Searching morph parquets: url={} filters={} body_size={}", uri.toString(), query_predicates.size(), body_str.size());
 
         auto buffer = BuilderRWBufferFromHTTP(uri)
             .withConnectionGroup(HTTPConnectionGroupType::DISK)
+            .withMethod(Poco::Net::HTTPRequest::HTTP_POST)
             .withSettings(context->getReadSettings())
             .withTimeouts(timeouts)
             .withHostFilter(&context->getRemoteHostFilter())
             .withHeaders(auth_headers)
+            .withOutCallback([&](std::ostream & ostr) { ostr << body_str; })
             .withDelayInit(false)
             .withSkipNotFound(false)
             .create(Poco::Net::HTTPBasicCredentials{});
@@ -219,19 +523,19 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
         readStringUntilEOF(response, *buffer);
         if (response.empty())
         {
-            LOG_DEBUG(log, "Morph list response is empty, ending pagination");
+            LOG_DEBUG(log, "Morph parquet search response is empty, ending pagination");
             break;
         }
 
         Poco::JSON::Parser parser;
         const auto parsed = parser.parse(response);
         if (parsed.type() != typeid(Poco::JSON::Object::Ptr))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected Morph API response when listing objects in {}", bucket);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected Morph API response when searching parquets in {}", bucket);
 
         const auto root = parsed.extract<Poco::JSON::Object::Ptr>();
         const auto array_value = root->get("objects");
         if (array_value.type() != typeid(Poco::JSON::Array::Ptr))
-            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Morph API response for bucket {} has no `objects` array", bucket);
+            throw Exception(ErrorCodes::BAD_ARGUMENTS, "Morph parquet search response for bucket {} has no `objects` array", bucket);
 
         const auto array = array_value.extract<Poco::JSON::Array::Ptr>();
         /// `Poco::JSON::Array::get` takes `unsigned int`; pages are capped at 1000 items.
@@ -242,54 +546,11 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
             if (max_keys > 0 && objects.size() >= max_keys)
                 break;
 
-            const auto entry_value = array->get(i);
-            if (entry_value.type() != typeid(Poco::JSON::Object::Ptr))
+            if (auto entry = parseSearchObjectEntry(array->get(i), i, log))
             {
-                LOG_WARNING(log, "Morph list entry at index {} is not a JSON object, skipping", i);
-                continue;
+                objects.emplace_back(std::move(entry));
+                ++parsed_in_page;
             }
-
-            const auto entry = entry_value.extract<Poco::JSON::Object::Ptr>();
-            if (!entry->has("path"))
-            {
-                LOG_WARNING(log, "Morph list entry at index {} is missing `path` field, skipping", i);
-                continue;
-            }
-            const auto path_value = entry->get("path");
-            if (!path_value.isString())
-            {
-                LOG_WARNING(log, "Morph list entry at index {} has non-string `path`, skipping", i);
-                continue;
-            }
-
-            const auto object_path = path_value.convert<String>();
-            if (object_path.empty())
-            {
-                LOG_WARNING(log, "Morph list entry at index {} has empty `path`, skipping", i);
-                continue;
-            }
-
-            ObjectMetadata meta;
-            if (entry->has("size"))
-                meta.size_bytes = entry->get("size").convert<UInt64>();
-            else
-                meta.is_size_known = false;
-
-            if (entry->has("creationDate"))
-            {
-                const auto creation_value = entry->get("creationDate");
-                if (creation_value.isString())
-                {
-                    /// Morph returns ISO-8601 like "2026-04-28T12:00:03+04:00"; best-effort parse.
-                    int tz_offset = 0;
-                    Poco::DateTime dt;
-                    if (Poco::DateTimeParser::tryParse(creation_value.convert<String>(), dt, tz_offset))
-                        meta.last_modified = Poco::Timestamp::fromEpochTime(dt.timestamp().epochTime());
-                }
-            }
-
-            objects.emplace_back(std::make_shared<RelativePathWithMetadata>(object_path, std::move(meta)));
-            ++parsed_in_page;
         }
 
         cursor.clear();
@@ -302,7 +563,7 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
 
         LOG_DEBUG(
             log,
-            "Morph list response: response_bytes={} array_size={} parsed_in_page={} total_so_far={} next_cursor={}",
+            "Morph parquet search response: response_bytes={} array_size={} parsed_in_page={} total_so_far={} next_cursor={}",
             response.size(),
             array_size,
             parsed_in_page,
@@ -315,6 +576,55 @@ RelativePathsWithMetadata MorphObjectStorage::fetchObjects(const std::string & p
             break;
     }
 
+    return objects;
+}
+
+RelativePathsWithMetadata MorphObjectStorage::fetchOneObjectByPrefix(const std::string & prefix) const
+{
+    RelativePathsWithMetadata objects;
+
+    Poco::URI uri(makeParquetMetaURL());
+    Poco::URI::QueryParameters query_parameters;
+    query_parameters.emplace_back("prefix", prefix);
+    uri.setQueryParameters(query_parameters);
+
+    LOG_DEBUG(log, "Fetching morph parquet meta: url={}", uri.toString());
+
+    auto buffer = BuilderRWBufferFromHTTP(uri)
+        .withConnectionGroup(HTTPConnectionGroupType::DISK)
+        .withSettings(context->getReadSettings())
+        .withTimeouts(ConnectionTimeouts::getHTTPTimeouts(context->getSettingsRef(), context->getServerSettings()))
+        .withHostFilter(&context->getRemoteHostFilter())
+        .withHeaders(makeAuthHeaders())
+        .withDelayInit(false)
+        .withSkipNotFound(false)
+        .create(Poco::Net::HTTPBasicCredentials{});
+
+    String response;
+    readStringUntilEOF(response, *buffer);
+    if (response.empty())
+        return objects;
+
+    Poco::JSON::Parser parser;
+    const auto parsed = parser.parse(response);
+    if (parsed.type() != typeid(Poco::JSON::Object::Ptr))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Unexpected Morph API response when fetching parquet meta in {}", bucket);
+
+    const auto root = parsed.extract<Poco::JSON::Object::Ptr>();
+    const auto array_value = root->get("objects");
+    if (array_value.type() != typeid(Poco::JSON::Array::Ptr))
+        throw Exception(ErrorCodes::BAD_ARGUMENTS, "Morph parquet meta response for bucket {} has no `objects` array", bucket);
+
+    const auto array = array_value.extract<Poco::JSON::Array::Ptr>();
+    /// The endpoint promises at most one object; defensively iterate in
+    /// case the server ever loosens the contract.
+    for (unsigned int i = 0; i < array->size(); ++i)
+    {
+        if (auto entry = parseSearchObjectEntry(array->get(i), i, log))
+            objects.emplace_back(std::move(entry));
+    }
+
+    LOG_DEBUG(log, "Morph parquet meta response: response_bytes={} parsed={}", response.size(), objects.size());
     return objects;
 }
 

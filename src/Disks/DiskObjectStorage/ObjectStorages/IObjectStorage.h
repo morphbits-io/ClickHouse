@@ -100,6 +100,9 @@ extern const int NOT_IMPLEMENTED;
 
 class ReadBufferFromFileBase;
 class WriteBufferFromFileBase;
+class ActionsDAG;
+struct StorageInMemoryMetadata;
+using StorageMetadataPtr = std::shared_ptr<const StorageInMemoryMetadata>;
 
 using ObjectAttributes = std::map<std::string, std::string>;
 
@@ -348,6 +351,18 @@ public:
     /// Returns the inner (unwrapped) object storage for decorator types such as `CachedObjectStorage`.
     /// Returns nullptr for non-decorator types, meaning this storage is already the base.
     virtual ObjectStoragePtr getUnderlying() { return nullptr; }
+
+    /// Optional hook letting a backend pushdown a query predicate
+    /// before the next listing call. Default is a no-op; backends
+    /// that don't support predicate pushdown ignore it. The
+    /// implementation walks the `ActionsDAG` itself — the base
+    /// class makes no assumption about how the predicate is
+    /// represented on the wire.
+    virtual void setQueryPredicate(
+        const ActionsDAG::Node * /*predicate*/,
+        const StorageMetadataPtr & /*metadata*/)
+    {
+    }
 };
 
 using ObjectStoragePtr = std::shared_ptr<IObjectStorage>;

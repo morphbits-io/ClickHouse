@@ -41,9 +41,10 @@ namespace
 /// Built-in fallback used only when neither <morph><endpoint> in the server
 /// config nor an explicit `endpoint=` argument is provided.
 constexpr auto DEFAULT_MORPH_ENDPOINT = "https://morph.morphbits.io";
-/// Morph addresses each parquet file by row group, e.g. `data.parquet/rg-0`,
-/// so the default glob has to descend one level past the parquet container.
-constexpr auto DEFAULT_PATH = "*.parquet/*";
+/// Morph stores each row group as `<stripped-basePath>/<N>.parquet`,
+/// so the default glob picks up two-segment paths whose leaf ends in
+/// `.parquet`.
+constexpr auto DEFAULT_PATH = "*/*.parquet";
 
 String trimTrailingSlash(String value)
 {
@@ -220,6 +221,17 @@ void StorageMorphConfiguration::initializeFromParsedArguments(const MorphStorage
     endpoint = trimTrailingSlash(parsed_arguments.endpoint);
     raw_uri = fmt::format("{}/v1/buckets/{}", endpoint, bucket);
     path = parsed_arguments.path.empty() ? DEFAULT_PATH : parsed_arguments.path;
+
+    /// Morph paths are listing prefixes, never exact object keys —
+    /// every "logical parquet" is a `<prefix>/<N>.parquet` fan-out.
+    /// If the user supplied no glob, append `/**` so the generic
+    /// dispatcher in `StorageObjectStorageSource::createFileIterator`
+    /// takes the `GlobIterator` branch and the static prefix flows
+    /// through to `V1SearchParquets`. Without this, no-glob paths
+    /// fall through to `KeysIterator` and emit a misdirected
+    /// `V1HeadObject` against the literal key.
+    if (path.path.find_first_of("*?{") == std::string::npos)
+        path.path += (path.path.empty() || path.path.back() == '/') ? "**" : "/**";
 }
 
 void StorageMorphConfiguration::fromNamedCollection(const NamedCollection & collection, ContextPtr context)
