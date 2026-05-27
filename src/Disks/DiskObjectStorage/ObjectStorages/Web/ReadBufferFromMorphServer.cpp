@@ -193,26 +193,22 @@ off_t ReadBufferFromMorphServer::getPosition()
 
 std::optional<size_t> ReadBufferFromMorphServer::tryGetFileSize()
 {
-    /// Lazily build `impl` so callers (notably the Parquet `Prefetcher`,
-    /// which queries the size before any read) can discover the size via
-    /// `RWBufferFromHTTP::tryGetFileSize` — that internally issues a HEAD
-    /// when no transaction has happened yet. Prefer the impl-reported size
-    /// over the constructor-supplied hint, since the hint may be `0`
-    /// ("unknown").
-    if (!impl)
-        impl = initialize();
-
-    if (auto sz = tryGetFileSizeFromReadBuffer(*impl); sz.has_value())
-        return sz;
-
-    /// Fall back to the constructor-supplied hint, treating `0` as "unknown"
-    /// so callers can pass `0` to defer size discovery without the
-    /// schema-inference iterator interpreting it as an empty file.
+    /// Prefer the size supplied at construction (carried from the Morph
+    /// listing's `$Object:payloadLength`). Returning it here lets callers
+    /// learn the size without a per-object HEAD. Treat `0` as "unknown" so
+    /// callers can pass `0` to defer discovery without the schema-inference
+    /// iterator interpreting it as an empty file. Only then lazily build
+    /// `impl` and let the HTTP buffer discover the size via
+    /// `RWBufferFromHTTP::tryGetFileSize`, which issues a HEAD when no
+    /// transaction has happened yet. Mirrors `ReadBufferFromS3::tryGetFileSize`.
     if (auto base = ReadBufferFromFileBase::tryGetFileSize();
         base.has_value() && *base > 0)
         return base;
 
-    return std::nullopt;
+    if (!impl)
+        impl = initialize();
+
+    return tryGetFileSizeFromReadBuffer(*impl);
 }
 
 }

@@ -26,6 +26,7 @@
 #include <Poco/URI.h>
 #include <fmt/format.h>
 
+#include <limits>
 #include <sstream>
 
 namespace DB
@@ -209,13 +210,20 @@ std::unique_ptr<ReadBufferFromFileBase> MorphObjectStorage::readObject(
     /// Reads go through the Parquet-aware endpoint which serves the stored
     /// object verbatim — each object is already a complete, self-contained
     /// single-row-group Parquet file produced at upload time. So the size
-    /// reported by `listObjects` is the right `Content-Length`; pass it in
-    /// when known to skip the per-read HEAD that
-    /// `ReadBufferFromMorphServer::tryGetFileSize` would otherwise issue.
+    /// reported by `listObjects` is the right `Content-Length`. It is carried
+    /// on the `StoredObject` (the channel the S3/Azure backends read), not
+    /// `read_hint`, which `StorageObjectStorageSource` never sets on this path;
+    /// pass it so `ReadBufferFromMorphServer::tryGetFileSize` can skip the
+    /// per-read HEAD. Treat the unset sentinel as "unknown" and fall back to
+    /// `read_hint`, then to `0`.
+    const size_t file_size = object.bytes_size != std::numeric_limits<uint64_t>::max()
+        ? object.bytes_size
+        : read_hint.value_or(0);
+
     return std::make_unique<ReadBufferFromMorphServer>(
         makeParquetObjectURL(object.remote_path),
         context,
-        read_hint.value_or(0),
+        file_size,
         patchSettings(read_settings),
         read_settings.remote_read_buffer_use_external_buffer,
         /* read_until_position */ 0,
