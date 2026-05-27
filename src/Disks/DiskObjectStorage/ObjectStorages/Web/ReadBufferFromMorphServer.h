@@ -56,20 +56,6 @@ public:
 
     bool supportsRightBoundedReads() const override { return true; }
 
-    /// Morph objects are consumed whole: each is a self-contained
-    /// single-row-group Parquet file, and the search endpoint already returns
-    /// only the objects whose row group matches the query (that pruning is the
-    /// optimization). Reporting the buffer as not-efficiently-seekable makes
-    /// ClickHouse's Parquet readers fetch the object with a single sequential
-    /// GET (no HTTP `Range`) and then slice the footer and column chunks in
-    /// memory — native v3 `Prefetcher` -> `EntireFileIsInMemory`, arrow
-    /// `asArrowFile` -> `asArrowFileLoadIntoMemory`. `supportsReadAt` stays at
-    /// its inherited `false`, so the two together select the whole-file path;
-    /// this also drops the per-object size-discovery HEAD, which only fires on
-    /// the seekable branch. `seek` is kept intact for any seekable fallback
-    /// path (e.g. when a filesystem cache wraps this buffer).
-    bool checkIfActuallySeekable() override { return false; }
-
 private:
     std::unique_ptr<SeekableReadBuffer> initialize();
 
