@@ -191,6 +191,57 @@ off_t ReadBufferFromMorphServer::getPosition()
 }
 
 
+size_t ReadBufferFromMorphServer::readBigAt(
+    char * to,
+    size_t n,
+    size_t range_begin,
+    const std::function<bool(size_t)> & progress_callback) const
+{
+    /// One-shot bounded `Range` GET, decoupled from `impl`/`offset`/
+    /// `read_until_position`. The Parquet `Prefetcher` calls this from
+    /// `io_runner` worker threads in `RandomRead` mode; multiple concurrent
+    /// calls touch disjoint `RWBufferFromHTTP` instances so no per-buffer lock
+    /// is needed. Reuses the same builder/timeouts/host-filter/headers as
+    /// `initialize` and the `DISK` connection group so sockets are pooled.
+    Poco::URI uri(url);
+    Poco::Net::HTTPBasicCredentials creds;
+
+    const auto & settings = context->getSettingsRef();
+    const auto & server_settings = context->getServerSettings();
+
+    auto connection_timeouts = ConnectionTimeouts::getHTTPTimeouts(settings, server_settings);
+    connection_timeouts.withConnectionTimeout(
+        std::max<Poco::Timespan>(settings[Setting::http_connection_timeout], Poco::Timespan(20, 0)));
+    connection_timeouts.withReceiveTimeout(
+        std::max<Poco::Timespan>(settings[Setting::http_receive_timeout], Poco::Timespan(20, 0)));
+
+    auto buf = BuilderRWBufferFromHTTP(uri)
+                   .withConnectionGroup(HTTPConnectionGroupType::DISK)
+                   .withSettings(read_settings)
+                   .withTimeouts(connection_timeouts)
+                   .withBufSize(buf_size)
+                   .withHostFilter(&context->getRemoteHostFilter())
+                   .withHeaders(headers)
+                   .withDelayInit(true)
+                   .create(creds);
+
+    buf->seek(range_begin, SEEK_SET);
+    buf->setReadUntilPosition(range_begin + n);
+
+    size_t bytes_read = 0;
+    while (bytes_read < n)
+    {
+        size_t chunk = buf->readBig(to + bytes_read, n - bytes_read);
+        if (chunk == 0)
+            break;
+        bytes_read += chunk;
+        if (progress_callback && progress_callback(bytes_read))
+            return bytes_read;
+    }
+    return bytes_read;
+}
+
+
 std::optional<size_t> ReadBufferFromMorphServer::tryGetFileSize()
 {
     /// Prefer the size supplied at construction (carried from the Morph

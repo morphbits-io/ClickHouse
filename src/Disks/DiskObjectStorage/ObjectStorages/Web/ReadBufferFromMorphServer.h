@@ -56,6 +56,20 @@ public:
 
     bool supportsRightBoundedReads() const override { return true; }
 
+    /// Morph endpoints serve plain HTTP `Range` GETs, so a one-shot bounded GET
+    /// is safe to issue from any thread independently of `impl`. Reporting
+    /// `supportsReadAt` switches the Parquet `Prefetcher` to `RandomRead` mode,
+    /// which drops the per-file `read_mutex` in `readSync` and lets column-chunk
+    /// reads run concurrently on `io_runner` (sized by `max_download_threads`).
+    /// Mirrors `ReadBufferFromS3`.
+    bool supportsReadAt() override { return true; }
+
+    size_t readBigAt(
+        char * to,
+        size_t n,
+        size_t range_begin,
+        const std::function<bool(size_t)> & progress_callback) const override;
+
 private:
     std::unique_ptr<SeekableReadBuffer> initialize();
 
