@@ -184,6 +184,15 @@ std::shared_ptr<IObjectIterator> StorageObjectStorageSource::createFileIterator(
 {
     const bool is_archive = configuration->isArchive();
 
+    /// Hand the query's filter `ActionsDAG` node and storage
+    /// metadata to the object storage so backends that can pushdown
+    /// predicates consume them before the next listing call. No-op
+    /// for backends that don't override the hook. Skipped under
+    /// distributed processing where the remote worker does its own
+    /// listing.
+    if (!distributed_processing)
+        object_storage->setQueryPredicate(predicate, storage_metadata);
+
     if (distributed_processing)
     {
         const bool expect_whole_archive = !local_context->getSettingsRef()[Setting::cluster_function_process_archive_on_multiple_nodes];

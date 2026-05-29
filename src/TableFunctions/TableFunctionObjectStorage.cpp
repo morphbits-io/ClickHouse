@@ -21,6 +21,7 @@
 #include <Storages/ObjectStorage/Azure/Configuration.h>
 #include <Storages/ObjectStorage/HDFS/Configuration.h>
 #include <Storages/ObjectStorage/Local/Configuration.h>
+#include <Storages/ObjectStorage/MorphConfiguration.h>
 #include <Storages/ObjectStorage/S3/Configuration.h>
 #include <Storages/ObjectStorage/StorageObjectStorage.h>
 #include <Storages/ObjectStorage/StorageObjectStorageCluster.h>
@@ -380,6 +381,18 @@ void registerTableFunctionObjectStorage(TableFunctionFactory & factory)
         {.allow_readonly = false}
     );
 #endif
+    factory.registerFunction<TableFunctionObjectStorage<MorphDefinition, StorageMorphConfiguration>>(
+        {
+            .description = R"(The table function can be used to read Parquet objects from a Morph bucket.)",
+            .examples{
+            {
+                MorphDefinition::name,
+                "SELECT * FROM morph(bucket, token, format, structure)", ""
+            }},
+            .category = FunctionDocumentation::Category::TableFunction
+        },
+        {.allow_readonly = false}
+    );
 }
 
 #if USE_AZURE_BLOB_STORAGE
@@ -399,6 +412,8 @@ template class TableFunctionObjectStorage<OSSDefinition, StorageS3Configuration>
 template class TableFunctionObjectStorage<HDFSDefinition, StorageHDFSConfiguration>;
 template class TableFunctionObjectStorage<HDFSClusterDefinition, StorageHDFSConfiguration>;
 #endif
+
+template class TableFunctionObjectStorage<MorphDefinition, StorageMorphConfiguration>;
 
 #if USE_AVRO
 template class TableFunctionObjectStorage<IcebergLocalClusterDefinition, StorageLocalIcebergConfiguration, true>;

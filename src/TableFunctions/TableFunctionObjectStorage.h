@@ -21,6 +21,7 @@ class StorageS3Configuration;
 class StorageAzureConfiguration;
 class StorageHDFSConfiguration;
 class StorageLocalConfiguration;
+class StorageMorphConfiguration;
 struct S3StorageSettings;
 struct AzureStorageSettings;
 struct HDFSStorageSettings;
@@ -120,6 +121,8 @@ using TableFunctionAzureBlob = TableFunctionObjectStorage<AzureDefinition, Stora
 #if USE_HDFS
 using TableFunctionHDFS = TableFunctionObjectStorage<HDFSDefinition, StorageHDFSConfiguration>;
 #endif
+
+using TableFunctionMorph = TableFunctionObjectStorage<MorphDefinition, StorageMorphConfiguration>;
 
 
 #if USE_AVRO
